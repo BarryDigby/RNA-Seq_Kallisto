@@ -1,0 +1,266 @@
+---
+title: "MA5112_RNA.rmd"
+author: "Barry"
+date: "09/01/2020"
+output: html_document
+---
+
+```{R}
+library(plyr)
+library(biomaRt)
+library(tximport)
+library(rhdf5)
+library(gplots)
+library(DESeq2)
+library(igraph)
+library(RColorBrewer)
+library(limma)
+library(WGCNA)
+library(IHW)
+library(PCAtools)
+library(tidyverse)
+library(org.Hs.eg.db)
+library(devtools)
+library(pheatmap)
+#install_github("ctlab/fgsea") #not on bioconductor or R repo
+library(fgsea)
+library(GOplot)
+```
+# Read in Kallisto Abundance Files
+```{r}
+dir <- ("/home/barry/Desktop/Nextflow/Kallisto_Quant")
+
+samples <- read.table(file.path(dir, "sra_runtable.csv"), 
+                        sep=",", header=T, row.names="Sample")
+
+files <- file.path(dir, rownames(samples), "abundance.h5")
+
+names(files) <- paste0(rownames(samples))
+```
+# Use bioMart to retrive the ENSEMBL Gene IDS corresponding to the ENSEMBL Transcript IDs
+```{r}
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+results <- getBM(attributes = c("ensembl_transcript_id_version", "ensembl_gene_id"), mart = mart)
+```
+# The tximport package converts transcript abundance to gene counts
+```{r}
+tx2gene <- results[, 1:2]
+#TXImport converts transcript quantification to gene level counts
+txi <- tximport(files, type = "kallisto", tx2gene = tx2gene)
+```
+# Create the DESeq2 'dds' object for analysis
+```{r}
+#Create the dds object for DESeq2 analysis
+dds <- DESeqDataSetFromTximport(txi, colData = samples, design = ~ Condition )
+dds$type <- relevel(dds$Condition, ref = "control") 
+dds <- estimateSizeFactors(dds)
+keep <- rowSums(counts(dds)) >= 20 #remove rows with counts less than 20
+dds <- dds[keep,]
+dds <- DESeq(dds)
+```
+# Extract the normalised counts from the dds object and log2 the data to do a quick QC
+```{r}
+cts <- counts(dds, normalized=T)
+log_counts <- log2(cts + 1)
+
+num_conditions <- nlevels(samples$Condition)
+pal <- colorRampPalette(brewer.pal(num_conditions, "Set1"))(num_conditions)
+cond_colors <- pal[as.integer(samples$Condition)]
+
+heatmap.2(cor(log_counts), RowSideColors=cond_colors,
+          trace='none', main='Sample correlations (log2-transformed)')
+```
+
+# Store the counts. Handy to so we dont have to Run DESeq2 every time (can be computationally expensive on large datsets).
+```{r}
+cts_out <- as.data.frame(cts)
+cts_out <- tibble::rownames_to_column(cts_out, "ensembl_gene_id")
+write.table(cts_out, "norm_counts.txt", sep="\t", quote = F, row.names = F)
+```
+
+# Run PCA on the samples. Outliers? Which samples do we expect to have the best results.
+```{r}
+p <- pca(log_counts, metadata = samples)
+
+biplot(p,
+  colby = 'Condition', colkey = c('melanoma'='royalblue', 'control'='red1', 'lung'='forestgreen'),
+  hline = 0, vline = 0,
+  legendPosition = 'right', legendLabSize = 12, legendIconSize = 8.0,
+  drawConnectors = TRUE,
+  title = 'PCA bi-plot',
+  subtitle = 'PC1 versus PC2')
+```
+
+# Set up the DESeq2 results object. Specify the contrast you want to make
+```{r}
+lung_v_ctrl <- results(dds, filterFun=ihw, alpha=0.05, c("Condition", "lung", "control"))
+summary(lung_v_ctrl)
+
+melanoma_v_ctrl <- results(dds, filterFun=ihw, alpha=0.05, c("Condition", "melanoma", "control"))
+summary(melanoma_v_ctrl)
+
+dds$condition <- relevel(dds$Condition, ref = "melanoma")
+lung_v_melanoma <- results(dds, filterFun=ihw, alpha=0.05, c("Condition", "lung", "melanoma"))
+summary(lung_v_melanoma)
+```
+
+# A function that outputs:
+# Up regulated genes + info 
+# Down Regulated genes + info
+# Perturbed genes as a character vector
+
+# Run the function on each DESeq results object to extract and annotate results. 
+```{r}
+generate_output <- function(x, prefix){
+  up_key <-  intersect(rownames(x)[which(x$log2FoldChange>=1.5)],
+                       rownames(x)[which(x$padj<=0.05)])
+  
+  up_df <- as.data.frame((x)[which(rownames(x) %in% up_key),])
+  up_df <- tibble::rownames_to_column(up_df, "ensembl_gene_id")
+  
+  info <- getBM(attributes=c("ensembl_gene_id",
+                        "external_gene_name",
+                        "chromosome_name",
+                        "start_position",
+                        "end_position",
+                        "description"),
+                        filters = c("ensembl_gene_id"),
+                        values = up_df$ensembl_gene_id,
+                        mart = mart)
+  
+  tmp <- merge(info, up_df, by="ensembl_gene_id")
+  tmp <- tmp[order(tmp$log2FoldChange),]
+  write.table(tmp, paste0(prefix,"_up_reg.txt"),
+              sep="\t", row.names = F, quote=F)
+  
+  down_key <- intersect(rownames(x)[which(x$log2FoldChange<=-1.5)],
+                        rownames(x)[which(x$padj<=0.05)])
+  
+  down_df <- as.data.frame((x)[which(rownames(x) %in% down_key),])
+  down_df <- tibble::rownames_to_column(down_df, "ensembl_gene_id")
+  
+  info <- getBM(attributes=c("ensembl_gene_id",
+                        "external_gene_name",
+                        "chromosome_name",
+                        "start_position",
+                        "end_position",
+                        "description"),
+                         filters = c("ensembl_gene_id"),
+                         values = down_df$ensembl_gene_id,
+                         mart = mart)
+  
+  tmp <- merge(info, down_df, by="ensembl_gene_id")
+  tmp <- tmp[order(tmp$log2FoldChange),]
+  write.table(tmp, paste0(prefix,"_down_reg.txt"), sep="\t", row.names = F, quote=F)
+  
+  sig_genes <- c(up_key, down_key)
+  write.table(sig_genes, paste0(prefix,"_sig_list.txt"), 
+              row.names = F, col.names = F, quote=F)
+}
+
+generate_output(lung_v_ctrl, "lung_v_ctrl")
+generate_output(melanoma_v_ctrl, "melanoma_v_ctrl")
+generate_output(lung_v_melanoma, "lung_v_melanoma")
+```
+
+# We will focus on Lung vs. Control for further visualisation and analysis. 
+# Feel free to go back and try this out for the other comparisons made
+```{r}
+rm(list=ls())
+#read in the DE file:
+de_gene <- read.table("/home/barry/lung_v_ctrl_sig_list.txt", sep = "\t", header=F)
+counts <- read.table("/home/barry/norm_counts.txt", header=T, sep="\t", row.names = "ensembl_gene_id")
+
+log_counts <- log2(counts + 1)
+
+key <- as.character(de_gene[,1])
+mat <- as.data.frame((log_counts)[which(rownames(log_counts) %in% key),])
+mat <- mat  %>% dplyr::select(-c(A375_1, A375_2, A375_3)) %>% slice(1:500)
+
+
+pdf("lung_v_control_heatmap.pdf", height = 10, width=7.5)
+pheatmap(mat, color=greenred(75), cluster_rows = T,
+         fontsize=9, 
+         show_rownames = F, scale = "row",
+         cellheight = 1, cellwidth = 30) #scale really important here! :)
+dev.off()
+```
+
+
+# GSEA
+# Use the MSigDB GMT files to see which pathways our DE genes belong to. 
+```{R}
+lung_v_ctrl_res <- read.csv("lung_v_ctrl_up_reg.txt", sep = "\t")
+
+fgsea_rank <- lung_v_ctrl_res %>%
+  dplyr::select(external_gene_name, stat) %>%
+  na.omit() %>%
+  distinct() %>%
+  group_by(external_gene_name) %>%
+  summarize(stat=mean(stat))
+
+rank <- deframe(fgsea_rank)
+
+pathways.kegg <- gmtPathways("~/c2.cp.kegg.v7.0.symbols.gmt")
+
+fgsea_kegg <- fgseaMultilevel(pathways=pathways.kegg, stats=rank) %>%
+  as_tibble() %>%
+  arrange(padj)
+```
+
+# This code will plot enrichment plots for every pathway that is statistically significant @ pval < 0.05. 
+```{r}
+filtered_pathway <- subset(fgsea_kegg, pval < 0.05)
+
+filtered_pathway <- as.vector(filtered_pathway$pathway)
+
+for (i in filtered_pathway){
+    pdf(paste0(i,".pdf"),height=5,width=5) # change height and width parameter
+    plt <- plotEnrichment(pathway = pathways.kegg[[i]], 
+    gseaParam = 1, ticksSize = 0.5, stats= rank) + 
+    labs(title=i) + theme(plot.title = element_text(hjust = 0.5, face="bold"))
+    print(plt)
+    dev.off()
+}
+```
+
+# For demonstration, we will take the top 5 pathways from our fgsea result. 
+# The code below converts the lists of genes into a binary matrix, and pulls the corresponding Log2FC information for each gene. 
+# We can then plot important genes and which pathways they share, ordered in ascending Log2FC 
+# will become apparent during tutorial (i hope)
+```{R}
+library(GOplot)
+subset_pathway <- fgsea_kegg[1:10,]
+
+list = list()
+cols = c()
+for (i in 1:nrow(subset_pathway)){
+  row <- subset_pathway[i,]
+  pathway <- row$pathway
+  cols <- c(cols, pathway)
+  list[[pathway]] = row$leadingEdge
+}
+
+binary_matrix <- list %>% lapply(table) %>% lapply(as.list) %>% 
+    lapply(data.frame) %>% rbind_all()
+binary_matrix <- t(binary_matrix)
+
+colnames(binary_matrix) <- cols
+binary_matrix[is.na(binary_matrix)] <- 0
+
+LFC_key <- lung_v_ctrl_res[lung_v_ctrl_res$external_gene_name %in% rownames(binary_matrix),]
+LFC_key <- LFC_key %>% dplyr::select(external_gene_name, log2FoldChange)
+rownames(LFC_key) = LFC_key$external_gene_name
+chord<- cbind(binary_matrix, LFC_key[rownames(binary_matrix), 2])
+column_key <- ncol(chord)
+chord <- chord[order(chord[,column_key]),]
+colnames(chord)[column_key] <- "logFC"
+
+
+pdf(file="Circos_plot.pdf", height =15,  width=15)
+GOChord(chord, space = 0.02, gene.order = 'logFC')
+dev.off()
+```
+```{r}
+writeLines(capture.output(sessionInfo()), "sessionInfo.txt")
+```
