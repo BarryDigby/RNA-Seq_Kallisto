@@ -35,7 +35,8 @@ samples <- read.table(file.path(dir, "sra_runtable.csv"),
 files <- file.path(dir, rownames(samples), "abundance.h5")
 names(files) <- paste0(rownames(samples))
 ```
-# Use bioMart to retrive the ENSEMBL Gene IDS corresponding to the ENSEMBL Transcript IDs
+# Create mart object
+# Use Mart object to retrive the ENSEMBL Gene IDS corresponding to the ENSEMBL Transcript IDs
 ```{r}
 mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
 results <- getBM(attributes = c("ensembl_transcript_id_version", "ensembl_gene_id"), mart = mart)
@@ -47,28 +48,51 @@ tx2gene <- results[, 1:2]
 txi <- tximport(files, type = "kallisto", tx2gene = tx2gene)
 ```
 # Create the DESeq2 'dds' object for analysis
+# Model tests condition while controlling for Rep
+# Convert numericals to factors
 ```{r}
 #Create the dds object for DESeq2 analysis
+samples$Rep <- as.factor(samples$Rep)
 dds <- DESeqDataSetFromTximport(txi, colData = samples, design = ~ Rep + Condition )
 dds$type <- relevel(dds$Condition, ref = "control") 
-dds <- estimateSizeFactors(dds)
 keep <- rowSums(counts(dds)) >= 20 #remove rows with counts less than 20
 dds <- dds[keep,]
-dds <- DESeq(dds)
+dds <- DESeq(dds) 
+
+rm(txi)
+
+pdf(file="~/Plots/Dispersion.pdf")
+plotDispEsts(dds)
+dev.off()
 ```
 # Extract the normalised counts from the dds object and log2 the data to do a quick QC
 ```{r}
 cts <- counts(dds, normalized=T)
 log_counts <- log2(cts + 1)
+```
+# Store the counts. Handy to so we dont have to Run DESeq2 every time (can be computationally expensive on large datsets).
+```{r}
+cts_out <- as.data.frame(cts)
+cts_out <- tibble::rownames_to_column(cts_out, "ensembl_gene_id")
+write.table(cts_out, "~/Results/norm_counts.txt", sep="\t", quote = F, row.names = F)
+```
+# Store the counts. Handy to so we dont have to Run DESeq2 every time (can be computationally expensive on large datsets).
+```{r}
+cts_out <- as.data.frame(cts)
+cts_out <- tibble::rownames_to_column(cts_out, "ensembl_gene_id")
+write.table(cts_out, "~/Results/norm_counts.txt", sep="\t", quote = F, row.names = F)
+```
+# Sample to Sample correlation heatmap
+```{r}
 num_conditions <- nlevels(samples$Condition)
 pal <- colorRampPalette(brewer.pal(num_conditions, "Set1"))(num_conditions)
 cond_colors <- pal[as.integer(samples$Condition)]
-
 pdf(file="~/Plots/sample_heatmap.pdf")
 heatmap.2(cor(log_counts), RowSideColors=cond_colors,
           trace='none', main='Sample correlations (log2-transformed)')
 dev.off()
 ```
+# sample hierarchical clustering (correlation between clusters formed)
 ```{R}
 result <- pvclust(log_counts, method.dist = "cor", method.hclust = "average", nboot = 500)
 pdf(file="~/Plots/sample_hclust.pdf")
@@ -76,17 +100,7 @@ plot(result)
 pvrect(result)
 dev.off()
 ```
-
-
-
-# Store the counts. Handy to so we dont have to Run DESeq2 every time (can be computationally expensive on large datsets).
-```{r}
-cts_out <- as.data.frame(cts)
-cts_out <- tibble::rownames_to_column(cts_out, "ensembl_gene_id")
-write.table(cts_out, "~/Results/norm_counts.txt", sep="\t", quote = F, row.names = F)
-```
-
-# Run PCA on the samples. Outliers? Which samples do we expect to have the best results.
+# Run PCA on the samples. Which samples do we expect to have the best results.
 ```{r}
 p <- pca(log_counts, metadata = samples)
 pdf(file="~/Plots/PCA.pdf")
@@ -99,19 +113,6 @@ biplot(p,
   subtitle = 'PC1 versus PC2')
 dev.off()
 ```
-
-```{r}
-pdf(file="~/Plots/cooks_distance.pdf")
-par(mar=c(8,5,2,2))
-boxplot(log10(assays(dds)[["cooks"]]), range=0, las=2)
-dev.off()
-
-pdf(file="~/Plots/Dispersion.pdf")
-plotDispEsts(dds)
-dev.off()
-```
-
-
 # Set up the DESeq2 results object. Specify the contrast you want to make
 ```{r}
 lung_v_ctrl <- results(dds, filterFun=ihw, alpha=0.05, c("Condition", "lung", "control"))
@@ -122,7 +123,7 @@ dds$condition <- relevel(dds$Condition, ref = "melanoma")
 lung_v_melanoma <- results(dds, filterFun=ihw, alpha=0.05, c("Condition", "lung", "melanoma"))
 summary(lung_v_melanoma)
 ```
-
+# insect p-value histogram (distribution of null hypothesis)
 ```{r}
 #pvalue histogram
 pdf(file="~/Results/p-val_hist.pdf")
@@ -131,12 +132,10 @@ abline(v=c(0.05),col="black",lwd=2,lty=2)
 legend("topright", "P-Value <0.05",lwd=2,lty=2)
 dev.off()
 ```
-
+# Volcano plot for Visualization of adj-pvalue / Log2FC.
 ```{r}
 #volcano before remove objects
 resOrdered <- as.data.frame(lung_v_ctrl[order(lung_v_ctrl$padj),])
-
-
 pdf(file="~/Results/A549_v_Ctrl_volcano.pdf")
 plot(resOrdered$log2FoldChange, resOrdered$padj, col="black", pch=1, cex=1.1,  main="A549 vs Ctrl Volcano Plot")
 fsig <-rownames(subset(resOrdered, log2FoldChange > 1.5 | log2FoldChange < -1.5,))
@@ -156,28 +155,19 @@ legend("topleft", legend_text,bty="n",pch = c(19,18,8), col=c("green","blue","re
 legend("topright", legend_text2, bty = "n", lty=c(1, 1), col=c("red", "black"))
 dev.off()
 ```
-
-
-
+# Looks bad, lets remove the 3 outliers. ENSG00000204392, ENSG00000284934, ENSG00000285395
 ```{r}
-#looks bad, lets remove the 3 outliers. ENSG00000204392, ENSG00000284934, ENSG00000285395
 resOrdered <- resOrdered[order(resOrdered$log2FoldChange),]
 resOrdered <- resOrdered[-c(1:3),]
-
-
 pdf(file="~/Results/A549_v_Ctrl_volcano(2).pdf")
 plot(resOrdered$log2FoldChange, resOrdered$padj, col="black", pch=1, cex=1.1,  main="A549 vs Ctrl Volcano Plot")
 fsig <-rownames(subset(resOrdered, log2FoldChange > 1.5 | log2FoldChange < -1.5,))
-#rm <- c("ENSG00000204392", "ENSG00000284934", "ENSG00000285395")
-#fsig <- fsig[!fsig %in% grep(paste0(rm, collapse = "|"), fsig, value = T)]
 fsig_resOrdered_plot=resOrdered[fsig,]
 points(fsig_resOrdered_plot$log2FoldChange, fsig_resOrdered_plot$padj, col="green", pch=19, cex=1.1)
 psig <-rownames(subset(resOrdered, pvalue < 0.05))
-#psig <- psig[!psig %in% grep(paste0(rm, collapse = "|"), psig, value = T)]
 psig_resOrdered_plot=resOrdered[psig,]
 points(psig_resOrdered_plot$log2FoldChange, psig_resOrdered_plot$padj, col="blue", pch=18, cex=0.5)
 qsig <-rownames(subset(resOrdered, padj < 0.05))
-#qsig <- qsig[!qsig %in% grep(paste0(rm, collapse = "|"), qsig, value = T)]
 qsig_resOrdered_plot=resOrdered[qsig,]
 points(qsig_resOrdered_plot$log2FoldChange, qsig_resOrdered_plot$padj, col="red", pch=8, cex=0.03)
 abline(v=c(1,-1), col="black", lwd=1.5)
@@ -187,18 +177,13 @@ legend_text2 = c("P-Adj <0.05", "Log2-Fold-Change -1.5 to 1.5")
 legend("topleft", legend_text,bty="n",pch = c(19,18,8), col=c("green","blue","red"))
 legend("topright", legend_text2, bty = "n", lty=c(1.5, 1.5), col=c("red", "black"))
 dev.off()
-
 ```
-
 # A function that outputs:
 # Up regulated genes + info 
 # Down Regulated genes + info
 # Perturbed genes as a character vector
-
-# Run the function on each DESeq results object to extract and annotate results. 
 ```{r}
 setwd("~/Results")
-
 generate_output <- function(x, prefix){
   up_key <-  intersect(rownames(x)[which(x$log2FoldChange>=1.5)],
                        rownames(x)[which(x$padj<=0.05)])
@@ -245,11 +230,14 @@ generate_output <- function(x, prefix){
   write.table(sig_genes, paste0(prefix,"_sig_list.txt"), 
               row.names = F, col.names = F, quote=F)
 }
-generate_output(lung_v_ctrl, "lung_v_ctrl")
-generate_output(melanoma_v_ctrl, "melanoma_v_ctrl")
-generate_output(lung_v_melanoma, "lung_v_melanoma")
 ```
-
+# Run the function for your DESeq results objects
+```{R}
+setwd("~/Results")
+generate_output(lung_v_ctrl, "lung_v_ctrl")
+#generate_output(melanoma_v_ctrl, "melanoma_v_ctrl")
+#generate_output(lung_v_melanoma, "lung_v_melanoma")
+```
 # We will focus on Lung vs. Control for further visualisation and analysis. 
 # Feel free to go back and try this out for the other comparisons made
 ```{r}
@@ -268,10 +256,8 @@ pheatmap(mat, color=greenred(75), cluster_rows = T,
          cellheight = 1, cellwidth = 30) #scale really important here! :)
 dev.off()
 ```
-
-
 # GSEA
-# Use the MSigDB GMT files to see which pathways our DE genes belong to. 
+# Use the MSigDB GMT files to see which pathways our DE genes belong to.
 ```{R}
 lung_v_ctrl_res <- read.csv("~/Results/lung_v_ctrl_up_reg.txt", sep = "\t")
 fgsea_rank <- lung_v_ctrl_res %>%
@@ -286,8 +272,7 @@ fgsea_kegg <- fgseaMultilevel(pathways=pathways.kegg, stats=rank) %>%
   as_tibble() %>%
   arrange(padj)
 ```
-
-# This code will plot enrichment plots for every pathway that is statistically significant @ pval < 0.05. 
+# This block will plot enrichment plots for every pathway that is statistically significant @ pval < 0.05. 
 ```{r}
 setwd("~/Plots/fgsea_kegg")
 filtered_pathway <- subset(fgsea_kegg, pval < 0.05)
@@ -301,7 +286,6 @@ for (i in filtered_pathway){
     dev.off()
 }
 ```
-
 # For demonstration, we will take the top 5 pathways from our fgsea result. 
 # The code below converts the lists of genes into a binary matrix, and pulls the corresponding Log2FC information for each gene. 
 # We can then plot important genes and which pathways they share, ordered in ascending Log2FC 
